@@ -1,0 +1,12 @@
+.env
+.dev.vars
+
+# --- Node ---
+worker/node_modules/
+worker/dist/
+worker/.wrangler/
+
+# --- Python ---
+engine/__pycache__/
+engine/*.pyc
+engine/.venv/
