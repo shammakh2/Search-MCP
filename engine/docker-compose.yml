@@ -1,0 +1,9 @@
+services:
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    ports:
+      - "11235:11235"
+    shm_size: "1g" # ← Chromium needs shared memory; Docker's default causes issues
+    env_file:
+      - .env
+    restart: unless-stopped
