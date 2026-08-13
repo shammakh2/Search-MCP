@@ -7,3 +7,12 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run
+    env_file:
+      - .env # supplies TUNNEL_TOKEN
+    restart: unless-stopped
+    depends_on:
+      - crawl4ai
