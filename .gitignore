@@ -5,6 +5,7 @@
 worker/node_modules/
 worker/dist/
 worker/.wrangler/
+worker/wrangler.jsonc
 
 # --- Python ---
 engine/__pycache__/
