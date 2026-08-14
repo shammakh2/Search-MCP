@@ -129,7 +129,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
     this.server.tool(
       "fetch_html",
-      "Fetch a webpage and return sanitized, preprocessed HTML — use when you need structured markup rather than markdown, e.g. for building extraction schemas.",
+      "Fetch a webpage, including JavaScript-rendered content, and return sanitized, preprocessed HTML — use when you need structured markup rather than markdown, e.g. for building extraction schemas.",
       { url: z.string().url().describe("Full URL of the page to fetch") },
       async ({ url }) => {
         const result = await callEngine(this.env, "/html", { url });
@@ -169,9 +169,13 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             "Engine didn't return an artifact URL for the screenshot",
           );
         }
-        const imageResponse = await fetch(artifactUrl, {
-          headers: { Authorization: `Bearer ${this.env.CRAWL4AI_API_TOKEN}` },
-        });
+        const imageResponse = await fetch(
+          new URL(artifactUrl, this.env.CRAWL4AI_ENGINE_URL).toString(),
+          {
+            headers: { Authorization: `Bearer ${this.env.CRAWL4AI_API_TOKEN}` },
+          },
+        );
+
         if (!imageResponse.ok) {
           return errorResult(
             `Could not retrieve the screenshot artifact (HTTP ${imageResponse.status})`,
@@ -213,21 +217,54 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
     this.server.tool(
       "crawl_urls",
-      "Crawl a list of URLs (up to 100) and return results for each as JSON. Use for fetching multiple pages in one call rather than one at a time.",
+      "Crawl a list of URLs (up to 100) and return results for each as JSON, including JavaScript-rendered content. Use for fetching multiple pages in one call rather than one at a time.",
       {
         urls: z
           .array(z.string().url())
           .min(1)
           .max(100)
           .describe("URLs to crawl"),
+        output: z
+          .array(
+            z.enum([
+              "markdown",
+              "html",
+              "links",
+              "media",
+              "metadata",
+              "tables",
+            ]),
+          )
+          .default(["markdown"])
+          .describe(
+            "Which data to include per URL. markdown: clean readable text (default). html: cleaned/sanitized HTML. links: internal/external links found on the page. media: images/videos/audios found. metadata: title/description/keywords/author. tables: extracted HTML tables as structured data.",
+          ),
       },
-      async ({ urls }) => {
+      async ({ urls, output }) => {
         const result = await callEngine(this.env, "/crawl", { urls });
         if (!result.ok) return errorResult(result.message);
+
+        const trimmed = (result.data.results ?? []).map((r: any) => {
+          const entry: Record<string, unknown> = {
+            url: r.url,
+            success: r.success,
+          };
+          if (!r.success) {
+            entry.error = r.error_message;
+            return entry;
+          }
+          if (output.includes("markdown"))
+            entry.markdown =
+              r.markdown?.fit_markdown || r.markdown?.raw_markdown || "";
+          if (output.includes("html")) entry.html = r.cleaned_html;
+          if (output.includes("links")) entry.links = r.links;
+          if (output.includes("media")) entry.media = r.media;
+          if (output.includes("metadata")) entry.metadata = r.metadata;
+          if (output.includes("tables")) entry.tables = r.tables;
+          return entry;
+        });
         return {
-          content: [
-            { type: "text", text: JSON.stringify(result.data, null, 2) },
-          ],
+          content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
         };
       },
     );
