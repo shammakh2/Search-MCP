@@ -2,3 +2,4 @@ COOKIE_ENCRYPTION_KEY=<your cookie cookie encryption key>
 ACCESS_PASSPHRASE=<your passphrase>
 CRAWL4AI_ENGINE_URL=<url for crawl4ai engine>
 CRAWL4AI_API_TOKEN=<randomly generated crawl4ai api token>
+SEARXNG_URL=<url for searxng engine>

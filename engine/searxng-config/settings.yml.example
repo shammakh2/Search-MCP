@@ -1,0 +1,9 @@
+use_default_settings: true
+search:
+  formats:
+    - html
+    - json
+server:
+  secret_key: "replace_with_your_own_generated_key"
+  limiter: false
+  image_proxy: true

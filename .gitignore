@@ -11,3 +11,4 @@ worker/wrangler.jsonc
 engine/__pycache__/
 engine/*.pyc
 engine/.venv/
+engine/searxng-config/settings.yml

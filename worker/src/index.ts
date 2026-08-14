@@ -62,6 +62,36 @@ function errorResult(message: string) {
   };
 }
 
+async function callSearxng(
+  env: Env,
+  path: string,
+  params: Record<string, string>,
+): Promise<{ ok: true; data: any } | { ok: false; message: string }> {
+  const url = new URL(`${env.SEARXNG_URL}${path}`);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+
+  let response: Response;
+  try {
+    response = await fetch(url.toString());
+  } catch (err: any) {
+    return {
+      ok: false,
+      message: `Could not reach the search engine: ${err.message}`,
+    };
+  }
+  if (!response.ok) {
+    return {
+      ok: false,
+      message: `Search engine returned HTTP ${response.status}`,
+    };
+  }
+  const data = await response.json().catch(() => null);
+  if (data === null) {
+    return { ok: false, message: "Search engine returned a non-JSON response" };
+  }
+  return { ok: true, data };
+}
+
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({
     name: "search-mcp",
@@ -193,6 +223,150 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
       },
       async ({ urls }) => {
         const result = await callEngine(this.env, "/crawl", { urls });
+        if (!result.ok) return errorResult(result.message);
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(result.data, null, 2) },
+          ],
+        };
+      },
+    );
+
+    this.server.tool(
+      "web_search",
+      "Search the web for a query and return a ranked list of results (title, URL, and a short snippet each). Use this to find relevant pages before fetching one in full with fetch_page.",
+      {
+        query: z.string().describe("The search query"),
+        time_range: z
+          .enum(["day", "week", "month", "year"])
+          .optional()
+          .describe("Restrict results to this recency window"),
+        language: z
+          .string()
+          .optional()
+          .describe(
+            "Language code for results, e.g. 'en'. Omit for all languages.",
+          ),
+      },
+      async ({ query, time_range, language }) => {
+        const params: Record<string, string> = { q: query, format: "json" };
+        if (time_range) params.time_range = time_range;
+        if (language) params.language = language;
+
+        const result = await callSearxng(this.env, "/search", params);
+        if (!result.ok) return errorResult(result.message);
+
+        const results = (result.data.results ?? [])
+          .slice(0, 10)
+          .map((r: any) => ({
+            title: r.title,
+            url: r.url,
+            snippet: r.content,
+          }));
+        if (results.length === 0)
+          return errorResult("No results found for this query");
+        return {
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+        };
+      },
+    );
+
+    this.server.tool(
+      "image_search",
+      "Search the web for images matching a query. Returns title, source page URL, and the direct image URL for each result.",
+      { query: z.string().describe("The search query") },
+      async ({ query }) => {
+        const result = await callSearxng(this.env, "/search", {
+          q: query,
+          format: "json",
+          categories: "images",
+        });
+        if (!result.ok) return errorResult(result.message);
+
+        const results = (result.data.results ?? [])
+          .slice(0, 10)
+          .map((r: any) => ({
+            title: r.title,
+            source_url: r.url,
+            image_url: r.img_src,
+            thumbnail_url: r.thumbnail_src ?? r.thumbnail,
+          }));
+        if (results.length === 0)
+          return errorResult("No image results found for this query");
+        return {
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+        };
+      },
+    );
+
+    this.server.tool(
+      "news_search",
+      "Search for recent news articles matching a query. Returns title, URL, snippet, and publish date where available.",
+      {
+        query: z.string().describe("The search query"),
+        time_range: z
+          .enum(["day", "week", "month", "year"])
+          .optional()
+          .describe("Restrict results to this recency window"),
+      },
+      async ({ query, time_range }) => {
+        const params: Record<string, string> = {
+          q: query,
+          format: "json",
+          categories: "news",
+        };
+        if (time_range) params.time_range = time_range;
+
+        const result = await callSearxng(this.env, "/search", params);
+        if (!result.ok) return errorResult(result.message);
+
+        const results = (result.data.results ?? [])
+          .slice(0, 10)
+          .map((r: any) => ({
+            title: r.title,
+            url: r.url,
+            snippet: r.content,
+            published: r.publishedDate,
+          }));
+        if (results.length === 0)
+          return errorResult("No news results found for this query");
+        return {
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+        };
+      },
+    );
+
+    this.server.tool(
+      "search_suggestions",
+      "Get autocomplete query suggestions for a partial search term — useful for query refinement before a full search.",
+      { query: z.string().describe("Partial search term") },
+      async ({ query }) => {
+        // Response shape not yet confirmed empirically — SearXNG's autocompleter
+        // commonly returns either a flat array of strings, or an OpenSearch-style
+        // [query, [suggestions]] pair. Handling both; first real call is the
+        // actual confirmation.
+        const result = await callSearxng(this.env, "/autocompleter", {
+          q: query,
+        });
+        if (!result.ok) return errorResult(result.message);
+
+        const suggestions = Array.isArray(result.data[0])
+          ? result.data[0]
+          : Array.isArray(result.data)
+            ? result.data
+            : (result.data[1] ?? result.data);
+        return {
+          content: [{ type: "text", text: JSON.stringify(suggestions) }],
+        };
+      },
+    );
+
+    this.server.tool(
+      "search_instance_info",
+      "Discover the search categories, engines, and plugins available on this SearXNG instance.",
+      {},
+      async () => {
+        const result = await callSearxng(this.env, "/config", {});
         if (!result.ok) return errorResult(result.message);
         return {
           content: [
