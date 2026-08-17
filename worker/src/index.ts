@@ -117,8 +117,80 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .string()
           .optional()
           .describe("Query string, used by bm25/llm modes to focus extraction"),
+        delay_before_return: z
+          .number()
+          .optional()
+          .describe(
+            "Seconds to wait after page load before extracting content (e.g. 2.5). Omit or set to 0 for fastest response.",
+          ),
+        wait_for: z
+          .string()
+          .optional()
+          .describe(
+            "CSS selector to wait for before extracting (e.g. '#content'). Omit or leave empty for fastest response.",
+          ),
       },
-      async ({ url, f, q }) => {
+      async ({ url, f, q, delay_before_return, wait_for }) => {
+        const hasDelay =
+          typeof delay_before_return === "number" && delay_before_return > 0;
+        const hasWaitFor =
+          typeof wait_for === "string" && wait_for.trim().length > 0;
+
+        // Route through /crawl ONLY when a non-zero delay or non-empty selector is requested
+        if (hasDelay || hasWaitFor) {
+          const payload: Record<string, unknown> = {
+            urls: [url],
+          };
+
+          const crawler_config: Record<string, unknown> = {};
+
+          if (hasWaitFor) {
+            const selector = wait_for!.trim();
+            crawler_config.wait_for =
+              selector.startsWith("css:") || selector.startsWith("js:")
+                ? selector
+                : `css:${selector}`;
+          }
+
+          if (hasDelay) {
+            const delayMs = Math.round(delay_before_return! * 1000);
+            payload.hooks = {
+              hooks: [
+                {
+                  action: "wait_for_timeout",
+                  params: { timeout_ms: delayMs },
+                },
+              ],
+            };
+          }
+
+          if (Object.keys(crawler_config).length > 0) {
+            payload.crawler_config = crawler_config;
+          }
+
+          const result = await callEngine(this.env, "/crawl", payload);
+          if (!result.ok) return errorResult(result.message);
+
+          const pageResult = result.data.results?.[0];
+          if (!pageResult || !pageResult.success) {
+            return errorResult(
+              pageResult?.error_message ?? "Failed to crawl page",
+            );
+          }
+
+          const markdown =
+            pageResult.markdown?.fit_markdown ||
+            pageResult.markdown?.raw_markdown ||
+            (typeof pageResult.markdown === "string"
+              ? pageResult.markdown
+              : "") ||
+            pageResult.cleaned_html ||
+            "";
+
+          return { content: [{ type: "text", text: markdown }] };
+        }
+
+        // Default fast route via /md (used when delay is 0/omitted and wait_for is empty/omitted)
         const result = await callEngine(this.env, "/md", { url, f, q });
         if (!result.ok) return errorResult(result.message);
         return {
@@ -130,14 +202,76 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
     this.server.tool(
       "fetch_html",
       "Fetch a webpage, including JavaScript-rendered content, and return sanitized, preprocessed HTML — use when you need structured markup rather than markdown, e.g. for building extraction schemas.",
-      { url: z.string().url().describe("Full URL of the page to fetch") },
-      async ({ url }) => {
+      {
+        url: z.string().url().describe("Full URL of the page to fetch"),
+        delay_before_return: z
+          .number()
+          .optional()
+          .describe(
+            "Seconds to wait after page load before extracting HTML (e.g. 2.5). Omit or set to 0 for fastest response.",
+          ),
+        wait_for: z
+          .string()
+          .optional()
+          .describe(
+            "CSS selector to wait for before extracting HTML (e.g. '#content'). Omit or leave empty for fastest response.",
+          ),
+      },
+      async ({ url, delay_before_return, wait_for }) => {
+        const hasDelay =
+          typeof delay_before_return === "number" && delay_before_return > 0;
+        const hasWaitFor =
+          typeof wait_for === "string" && wait_for.trim().length > 0;
+
+        // Route through /crawl ONLY when a non-zero delay or non-empty selector is requested
+        if (hasDelay || hasWaitFor) {
+          const payload: Record<string, unknown> = {
+            urls: [url],
+          };
+
+          const crawler_config: Record<string, unknown> = {};
+
+          if (hasWaitFor) {
+            const selector = wait_for!.trim();
+            crawler_config.wait_for =
+              selector.startsWith("css:") || selector.startsWith("js:")
+                ? selector
+                : `css:${selector}`;
+          }
+
+          if (hasDelay) {
+            const delayMs = Math.round(delay_before_return! * 1000);
+            payload.hooks = {
+              hooks: [
+                {
+                  action: "wait_for_timeout",
+                  params: { timeout_ms: delayMs },
+                },
+              ],
+            };
+          }
+
+          if (Object.keys(crawler_config).length > 0) {
+            payload.crawler_config = crawler_config;
+          }
+
+          const result = await callEngine(this.env, "/crawl", payload);
+          if (!result.ok) return errorResult(result.message);
+
+          const pageResult = result.data.results?.[0];
+          if (!pageResult || !pageResult.success) {
+            return errorResult(
+              pageResult?.error_message ?? "Failed to crawl page",
+            );
+          }
+
+          const html = pageResult.cleaned_html || pageResult.html || "";
+          return { content: [{ type: "text", text: html }] };
+        }
+
+        // Default fast route via /html (used when delay is 0/omitted and wait_for is empty/omitted)
         const result = await callEngine(this.env, "/html", { url });
         if (!result.ok) return errorResult(result.message);
-        // Exact response field isn't confirmed from the tool schema alone
-        // (that only showed the input shape) — fall back to the raw body
-        // if the expected field isn't there, rather than silently
-        // returning nothing.
         const text = result.data.html ?? JSON.stringify(result.data);
         return { content: [{ type: "text", text }] };
       },
@@ -191,7 +325,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
     this.server.tool(
       "execute_js",
-      "Load a webpage and run one or more JavaScript snippets against it, returning the result. Use for interacting with a page (clicking, scrolling, reading dynamic state) beyond plain content extraction.",
+      "Execute a sequence of JavaScript snippets on the specified URL. Return the full CrawlResult JSON (first result). Use this when you need to interact with dynamic pages using JS. REMEMBER: Scripts accept a list of separated JS snippets to execute and execute them in order. IMPORTANT: Each script should be an expression that returns a value. It can be an IIFE or an async function. You can think of it as such. Your script will replace '{script}' and execute in the browser context. So provide either an IIFE or a sync/async function that returns a value. Return Format: - The return result is an instance of CrawlResult, so you have access to markdown, links, and other stuff. If this is enough, you don't need to call again for other endpoints. ```python class CrawlResult(BaseModel): url: str html: str success: bool cleaned_html: Optional[str] = None media: Dict[str, List[Dict]] = {} links: Dict[str, List[Dict]] = {} downloaded_files: Optional[List[str]] = None js_execution_result: Optional[Dict[str, Any]] = None screenshot: Optional[str] = None pdf: Optional[bytes] = None mhtml: Optional[str] = None _markdown: Optional[MarkdownGenerationResult] = PrivateAttr(default=None) extracted_content: Optional[str] = None metadata: Optional[dict] = None error_message: Optional[str] = None session_id: Optional[str] = None response_headers: Optional[dict] = None status_code: Optional[int] = None ssl_certificate: Optional[SSLCertificate] = None dispatch_result: Optional[DispatchResult] = None redirected_url: Optional[str] = None network_requests: Optional[List[Dict[str, Any]]] = None console_messages: Optional[List[Dict[str, Any]]] = None class MarkdownGenerationResult(BaseModel): raw_markdown: str markdown_with_citations: str references_markdown: str fit_markdown: Optional[str] = None fit_html: Optional[str] = None ```",
       {
         url: z.string().url().describe("Full URL of the page to load first"),
         scripts: z
