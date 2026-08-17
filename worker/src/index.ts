@@ -279,44 +279,68 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
     this.server.tool(
       "screenshot_page",
-      "Capture a full-page PNG screenshot of a webpage.",
+      "Capture a PNG screenshot of a webpage from top to bottom. Uses an expandable virtual viewport canvas to capture long pages quickly without timing out.",
       {
         url: z.string().url().describe("Full URL of the page to capture"),
         screenshot_wait_for: z
           .number()
-          .default(2)
-          .describe("Seconds to wait before capturing"),
+          .default(1)
+          .describe(
+            "Seconds to wait after page load before taking the screenshot",
+          ),
+        viewport_height: z
+          .number()
+          .default(3000)
+          .describe(
+            "Height of the browser viewport in pixels (e.g. 3000, 5000, 8000). Increase this value for long articles or documentation pages to capture more vertical content in a single image.",
+          ),
       },
-      async ({ url, screenshot_wait_for }) => {
-        const result = await callEngine(this.env, "/screenshot", {
-          url,
-          screenshot_wait_for,
-        });
+      async ({ url, screenshot_wait_for, viewport_height }) => {
+        const payload: Record<string, unknown> = {
+          urls: [url],
+          browser_config: {
+            viewport_width: 1920,
+            viewport_height: viewport_height, // Expands virtual canvas to full page height
+          },
+          crawler_config: {
+            screenshot: true,
+            scan_full_page: false, // Keeps scroller disabled to prevent 100-step loop timeouts
+            wait_until: "domcontentloaded",
+            page_timeout: 15000,
+          },
+        };
+
+        if (screenshot_wait_for > 0) {
+          const delayMs = Math.round(screenshot_wait_for * 1000);
+          payload.hooks = {
+            hooks: [
+              {
+                action: "wait_for_timeout",
+                params: { timeout_ms: delayMs },
+              },
+            ],
+          };
+        }
+
+        const result = await callEngine(this.env, "/crawl", payload);
         if (!result.ok) return errorResult(result.message);
 
-        // The initial response only hands back an artifact reference, not
-        // the image itself — a second authenticated fetch is needed to
-        // actually retrieve the bytes.
-        const artifactUrl = result.data.url;
-        if (!artifactUrl) {
+        const pageResult = result.data.results?.[0];
+        if (!pageResult || !pageResult.success) {
           return errorResult(
-            "Engine didn't return an artifact URL for the screenshot",
+            pageResult?.error_message ?? "Failed to capture page screenshot",
           );
         }
-        const imageResponse = await fetch(
-          new URL(artifactUrl, this.env.CRAWL4AI_ENGINE_URL).toString(),
-          {
-            headers: { Authorization: `Bearer ${this.env.CRAWL4AI_API_TOKEN}` },
-          },
-        );
 
-        if (!imageResponse.ok) {
-          return errorResult(
-            `Could not retrieve the screenshot artifact (HTTP ${imageResponse.status})`,
-          );
+        let base64 = pageResult.screenshot;
+        if (!base64) {
+          return errorResult("Engine failed to generate screenshot");
         }
-        const bytes = await imageResponse.arrayBuffer();
-        const base64 = btoa(String.fromCharCode(...new Uint8Array(bytes)));
+
+        if (base64.startsWith("data:")) {
+          base64 = base64.replace(/^data:image\/\w+;base64,/, "");
+        }
+
         return {
           content: [{ type: "image", data: base64, mimeType: "image/png" }],
         };
