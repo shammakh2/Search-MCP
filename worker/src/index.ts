@@ -41,9 +41,9 @@ async function callEngine(
   // FastAPI's {"detail": "..."} shape, confirmed against the real engine
   // back at step 3-4.
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
+    const errorBody = await response.json().catch(() => null);
     const message =
-      (body as { detail?: string } | null)?.detail ??
+      (errorBody as { detail?: string } | null)?.detail ??
       `Engine returned HTTP ${response.status}`;
     return { ok: false, message };
   }
@@ -433,12 +433,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
     this.server.tool(
       "crawl_urls",
-      "Crawl a list of URLs (up to 100) and return results for each as JSON, including JavaScript-rendered content. Use for fetching multiple pages in one call rather than one at a time.",
+      "Crawl a list of URLs (up to 20) and return results for each as JSON, including JavaScript-rendered content. Use for fetching multiple pages in one call rather than one at a time.",
       {
         urls: z
           .array(z.string().url())
           .min(1)
-          .max(100)
+          .max(20)
           .describe("URLs to crawl"),
         output: z
           .array(
@@ -455,9 +455,45 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .describe(
             "Which data to include per URL. markdown: clean readable text (default). html: cleaned/sanitized HTML. links: internal/external links found on the page. media: images/videos/audios found. metadata: title/description/keywords/author. tables: extracted HTML tables as structured data.",
           ),
+        delay_before_return: z
+          .number()
+          .optional()
+          .describe(
+            "Seconds to wait after page load before extracting content, applied to every URL in this batch (e.g. 2.5). Omit for fastest response.",
+          ),
+        wait_for: z
+          .string()
+          .optional()
+          .describe(
+            "CSS selector to wait for before extracting, applied to every URL in this batch. Omit for fastest response.",
+          ),
       },
-      async ({ urls, output }) => {
-        const result = await callEngine(this.env, "/crawl", { urls });
+      async ({ urls, output, delay_before_return, wait_for }) => {
+        const payload: Record<string, unknown> = { urls };
+        const crawler_config: Record<string, unknown> = {};
+
+        if (typeof wait_for === "string" && wait_for.trim().length > 0) {
+          const selector = wait_for.trim();
+          crawler_config.wait_for =
+            selector.startsWith("css:") || selector.startsWith("js:")
+              ? selector
+              : `css:${selector}`;
+        }
+        payload.crawler_config = crawler_config;
+
+        if (
+          typeof delay_before_return === "number" &&
+          delay_before_return > 0
+        ) {
+          const delayMs = Math.round(delay_before_return * 1000);
+          payload.hooks = {
+            hooks: [
+              { action: "wait_for_timeout", params: { timeout_ms: delayMs } },
+            ],
+          };
+        }
+
+        const result = await callEngine(this.env, "/crawl", payload);
         if (!result.ok) return errorResult(result.message);
 
         const trimmed = (result.data.results ?? []).map((r: any) => {
@@ -500,8 +536,14 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .describe(
             "Language code for results, e.g. 'en'. Omit for all languages.",
           ),
+        max_results: z
+          .number()
+          .min(1)
+          .max(20)
+          .default(10)
+          .describe("How many results to return (1-20, default 10)."),
       },
-      async ({ query, time_range, language }) => {
+      async ({ query, time_range, language, max_results }) => {
         const params: Record<string, string> = { q: query, format: "json" };
         if (time_range) params.time_range = time_range;
         if (language) params.language = language;
@@ -510,7 +552,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         if (!result.ok) return errorResult(result.message);
 
         const results = (result.data.results ?? [])
-          .slice(0, 10)
+          .slice(0, max_results)
           .map((r: any) => ({
             title: r.title,
             url: r.url,
@@ -527,8 +569,16 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
     this.server.tool(
       "image_search",
       "Search the web for images matching a query. Returns title, source page URL, and the direct image URL for each result.",
-      { query: z.string().describe("The search query") },
-      async ({ query }) => {
+      {
+        query: z.string().describe("The search query"),
+        max_results: z
+          .number()
+          .min(1)
+          .max(20)
+          .default(10)
+          .describe("How many results to return (1-20, default 10)."),
+      },
+      async ({ query, max_results }) => {
         const result = await callSearxng(this.env, "/search", {
           q: query,
           format: "json",
@@ -537,7 +587,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         if (!result.ok) return errorResult(result.message);
 
         const results = (result.data.results ?? [])
-          .slice(0, 10)
+          .slice(0, max_results)
           .map((r: any) => ({
             title: r.title,
             source_url: r.url,
@@ -561,8 +611,14 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .enum(["day", "week", "month", "year"])
           .optional()
           .describe("Restrict results to this recency window"),
+        max_results: z
+          .number()
+          .min(1)
+          .max(20)
+          .default(10)
+          .describe("How many results to return (1-20, default 10)."),
       },
-      async ({ query, time_range }) => {
+      async ({ query, time_range, max_results }) => {
         const params: Record<string, string> = {
           q: query,
           format: "json",
@@ -574,7 +630,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         if (!result.ok) return errorResult(result.message);
 
         const results = (result.data.results ?? [])
-          .slice(0, 10)
+          .slice(0, max_results)
           .map((r: any) => ({
             title: r.title,
             url: r.url,
@@ -617,10 +673,24 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
       async () => {
         const result = await callSearxng(this.env, "/config", {});
         if (!result.ok) return errorResult(result.message);
+
+        // Trimmed from SearXNG's full /config dump down to what a model
+        // actually needs to pick a category or engine. Field names match
+        // SearXNG's documented /config shape — unverified against this
+        // specific instance, worth a quick diff the first time this runs.
+        const d = result.data;
+        const trimmed = {
+          categories: d.categories ?? [],
+          engines: (d.engines ?? [])
+            .filter((e: any) => e.enabled !== false)
+            .map((e: any) => ({ name: e.name, categories: e.categories })),
+          plugins: (d.plugins ?? [])
+            .filter((p: any) => p.enabled !== false)
+            .map((p: any) => p.name),
+        };
+
         return {
-          content: [
-            { type: "text", text: JSON.stringify(result.data, null, 2) },
-          ],
+          content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
         };
       },
     );
