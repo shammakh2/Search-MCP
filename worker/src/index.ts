@@ -108,15 +108,17 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .url()
           .describe("Full URL of the page to fetch, including https://"),
         f: z
-          .enum(["fit", "raw", "bm25", "llm"])
+          .enum(["fit", "raw", "bm25"])
           .default("fit")
           .describe(
-            "Extraction mode: fit (clean readable content, default), raw (direct HTML-to-markdown), bm25 (keyword relevance ranking), llm (summarization)",
+            "Extraction mode: fit (clean readable content, default — strips nav/ads/boilerplate), raw (direct HTML-to-markdown, no filtering), bm25 (rank content blocks by relevance to q and keep only the top matches — requires q).",
           ),
         q: z
           .string()
           .optional()
-          .describe("Query string, used by bm25/llm modes to focus extraction"),
+          .describe(
+            "Search query. Required when f='bm25' (used to rank content blocks by relevance); ignored for fit/raw.",
+          ),
         delay_before_return: z
           .number()
           .optional()
@@ -131,6 +133,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           ),
       },
       async ({ url, f, q, delay_before_return, wait_for }) => {
+        if (f === "bm25" && (!q || q.trim().length === 0)) {
+          return errorResult(
+            "f='bm25' requires a non-empty q — it's the query content blocks are ranked against.",
+          );
+        }
+
         const hasDelay =
           typeof delay_before_return === "number" && delay_before_return > 0;
         const hasWaitFor =
@@ -138,11 +146,35 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
         // Route through /crawl ONLY when a non-zero delay or non-empty selector is requested
         if (hasDelay || hasWaitFor) {
-          const payload: Record<string, unknown> = {
-            urls: [url],
-          };
+          const payload: Record<string, unknown> = { urls: [url] };
 
-          const crawler_config: Record<string, unknown> = {};
+          const markdown_generator =
+            f === "raw"
+              ? { type: "DefaultMarkdownGenerator", params: {} }
+              : f === "bm25"
+                ? {
+                    type: "DefaultMarkdownGenerator",
+                    params: {
+                      content_filter: {
+                        type: "BM25ContentFilter",
+                        params: { user_query: q },
+                      },
+                    },
+                  }
+                : {
+                    // fit (default)
+                    type: "DefaultMarkdownGenerator",
+                    params: {
+                      content_filter: {
+                        type: "PruningContentFilter",
+                        params: {},
+                      },
+                    },
+                  };
+
+          const crawler_config: Record<string, unknown> = {
+            markdown_generator,
+          };
 
           if (hasWaitFor) {
             const selector = wait_for!.trim();
@@ -152,20 +184,15 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
                 : `css:${selector}`;
           }
 
+          payload.crawler_config = crawler_config;
+
           if (hasDelay) {
             const delayMs = Math.round(delay_before_return! * 1000);
             payload.hooks = {
               hooks: [
-                {
-                  action: "wait_for_timeout",
-                  params: { timeout_ms: delayMs },
-                },
+                { action: "wait_for_timeout", params: { timeout_ms: delayMs } },
               ],
             };
-          }
-
-          if (Object.keys(crawler_config).length > 0) {
-            payload.crawler_config = crawler_config;
           }
 
           const result = await callEngine(this.env, "/crawl", payload);
@@ -179,18 +206,27 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           }
 
           const markdown =
-            pageResult.markdown?.fit_markdown ||
-            pageResult.markdown?.raw_markdown ||
-            (typeof pageResult.markdown === "string"
-              ? pageResult.markdown
-              : "") ||
-            pageResult.cleaned_html ||
-            "";
+            f === "raw"
+              ? pageResult.markdown?.raw_markdown ||
+                (typeof pageResult.markdown === "string"
+                  ? pageResult.markdown
+                  : "")
+              : pageResult.markdown?.fit_markdown ||
+                pageResult.markdown?.raw_markdown ||
+                (typeof pageResult.markdown === "string"
+                  ? pageResult.markdown
+                  : "");
+
+          if (!markdown) {
+            return errorResult(
+              "Engine returned no markdown content for this page",
+            );
+          }
 
           return { content: [{ type: "text", text: markdown }] };
         }
 
-        // Default fast route via /md (used when delay is 0/omitted and wait_for is empty/omitted)
+        // Default fast route via /md
         const result = await callEngine(this.env, "/md", { url, f, q });
         if (!result.ok) return errorResult(result.message);
         return {
@@ -290,9 +326,11 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           ),
         viewport_height: z
           .number()
+          .min(1000)
+          .max(3500)
           .default(3000)
           .describe(
-            "Height of the browser viewport in pixels (e.g. 3000, 5000, 8000). Increase this value for long articles or documentation pages to capture more vertical content in a single image.",
+            "Height of the browser viewport in pixels. Increase for long pages to capture more vertical content in one image. Keep at or below ~3500 — taller values have failed in testing on visually dense pages (confirmed: Wikipedia's Berlin article failed at 4000 through the real connector, twice, while succeeding at 3000). If you need a taller capture, try it — this cap is conservative, not a hard engine limit — but treat failures as expected at the high end for image-heavy pages.",
           ),
       },
       async ({ url, screenshot_wait_for, viewport_height }) => {
