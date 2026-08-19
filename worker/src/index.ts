@@ -21,8 +21,19 @@ async function callEngine(
         Authorization: `Bearer ${env.CRAWL4AI_API_TOKEN}`,
       },
       body: JSON.stringify(body),
+      // 90s, not the hook system's 60s max — a legitimate delay_before_return
+      // near 60s must finish before this fires, or it'd falsely abort a
+      // valid wait rather than catch a genuinely hung request.
+      signal: AbortSignal.timeout(90_000),
     });
   } catch (err: any) {
+    if (err.name === "TimeoutError" || err.name === "AbortError") {
+      return {
+        ok: false,
+        message:
+          "Engine did not respond within 90s — likely a wait_for selector that never matched, or the target site hanging.",
+      };
+    }
     return { ok: false, message: `Could not reach the engine: ${err.message}` };
   }
 
@@ -52,6 +63,16 @@ async function callEngine(
     };
   }
 
+  if (data.hooks?.status?.status && data.hooks.status.status !== "success") {
+    const errors = data.hooks.status.validation_errors?.length
+      ? data.hooks.status.validation_errors.join("; ")
+      : JSON.stringify(data.hooks.errors ?? data.hooks.status);
+    return {
+      ok: false,
+      message: `Hook attachment failed (${data.hooks.status.status}): ${errors}`,
+    };
+  }
+
   return { ok: true, data };
 }
 
@@ -72,17 +93,19 @@ async function callSearxng(
 
   let response: Response;
   try {
-    response = await fetch(url.toString());
+    response = await fetch(url.toString(), {
+      signal: AbortSignal.timeout(15_000),
+    });
   } catch (err: any) {
+    if (err.name === "TimeoutError" || err.name === "AbortError") {
+      return {
+        ok: false,
+        message: "Search engine did not respond within 15s.",
+      };
+    }
     return {
       ok: false,
       message: `Could not reach the search engine: ${err.message}`,
-    };
-  }
-  if (!response.ok) {
-    return {
-      ok: false,
-      message: `Search engine returned HTTP ${response.status}`,
     };
   }
   const data = await response.json().catch(() => null);
@@ -95,7 +118,7 @@ async function callSearxng(
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({
     name: "search-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   async init() {
@@ -395,9 +418,6 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .describe("JavaScript snippets to execute, in order"),
       },
       async ({ url, scripts }) => {
-        // Endpoint name inferred from crawl4ai's documented REST API, not
-        // directly confirmed from the (truncated) tool schema — first
-        // real call here doubles as the confirmation.
         const result = await callEngine(this.env, "/execute_js", {
           url,
           scripts,
@@ -574,10 +594,6 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
       "Get autocomplete query suggestions for a partial search term — useful for query refinement before a full search.",
       { query: z.string().describe("Partial search term") },
       async ({ query }) => {
-        // Response shape not yet confirmed empirically — SearXNG's autocompleter
-        // commonly returns either a flat array of strings, or an OpenSearch-style
-        // [query, [suggestions]] pair. Handling both; first real call is the
-        // actual confirmation.
         const result = await callSearxng(this.env, "/autocompleter", {
           q: query,
         });
