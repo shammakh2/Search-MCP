@@ -4,6 +4,18 @@ import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import { AuthHandler, type Props } from "./auth-handler";
 
+function safeHandler<A extends unknown[]>(
+  handler: (...args: A) => Promise<any>,
+): (...args: A) => Promise<any> {
+  return async (...args: A) => {
+    try {
+      return await handler(...args);
+    } catch (err: any) {
+      return errorResult(`Unexpected error: ${err?.message ?? String(err)}`);
+    }
+  };
+}
+
 // Shared helper: every crawl4ai REST call needs the same auth header, the
 // same "is this actually a success" check, and the same error shape back to
 // the model. One place to get that right instead of five.
@@ -42,9 +54,23 @@ async function callEngine(
   // back at step 3-4.
   if (!response.ok) {
     const errorBody = await response.json().catch(() => null);
-    const message =
-      (errorBody as { detail?: string } | null)?.detail ??
-      `Engine returned HTTP ${response.status}`;
+    let message = `Engine returned HTTP ${response.status}`;
+    const rawDetail = (errorBody as { detail?: string } | null)?.detail;
+    if (rawDetail) {
+      try {
+        const parsed = JSON.parse(rawDetail);
+        message = parsed.correlation_id
+          ? `${parsed.error ?? "Engine error"} (correlation_id: ${parsed.correlation_id})`
+          : (parsed.error ?? rawDetail);
+      } catch {
+        message = rawDetail;
+      }
+    } else if (errorBody && typeof (errorBody as any).error === "string") {
+      const eb = errorBody as { error: string; correlation_id?: string };
+      message = eb.correlation_id
+        ? `${eb.error} (correlation_id: ${eb.correlation_id})`
+        : eb.error;
+    }
     return { ok: false, message };
   }
 
@@ -53,23 +79,21 @@ async function callEngine(
     return { ok: false, message: "Engine returned a non-JSON response" };
   }
 
-  // Crawl-level failures (timeout, unreachable target, etc.) — 200 status
-  // but success:false in the body, per crawl4ai's documented CrawlResult
-  // shape, same as fetch_page confirmed earlier.
+  if (
+    typeof data.error === "string" &&
+    !("results" in data) &&
+    !("markdown" in data)
+  ) {
+    const message = data.correlation_id
+      ? `${data.error} (correlation_id: ${data.correlation_id})`
+      : data.error;
+    return { ok: false, message };
+  }
+
   if (typeof data.success === "boolean" && !data.success) {
     return {
       ok: false,
       message: data.error_message ?? "Engine reported failure with no message",
-    };
-  }
-
-  if (data.hooks?.status?.status && data.hooks.status.status !== "success") {
-    const errors = data.hooks.status.validation_errors?.length
-      ? data.hooks.status.validation_errors.join("; ")
-      : JSON.stringify(data.hooks.errors ?? data.hooks.status);
-    return {
-      ok: false,
-      message: `Hook attachment failed (${data.hooks.status.status}): ${errors}`,
     };
   }
 
@@ -155,7 +179,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             "CSS selector to wait for before extracting (e.g. '#content'). Omit or leave empty for fastest response.",
           ),
       },
-      async ({ url, f, q, delay_before_return, wait_for }) => {
+      safeHandler(async ({ url, f, q, delay_before_return, wait_for }) => {
+        if (/\.pdf(\?|#|$)/i.test(url)) {
+          return errorResult(
+            "This URL appears to be a PDF, which this tool can't parse.",
+          );
+        }
         if (f === "bm25" && (!q || q.trim().length === 0)) {
           return errorResult(
             "f='bm25' requires a non-empty q — it's the query content blocks are ranked against.",
@@ -255,7 +284,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: result.data.markdown ?? "" }],
         };
-      },
+      }),
     );
 
     this.server.tool(
@@ -276,7 +305,12 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             "CSS selector to wait for before extracting HTML (e.g. '#content'). Omit or leave empty for fastest response.",
           ),
       },
-      async ({ url, delay_before_return, wait_for }) => {
+      safeHandler(async ({ url, delay_before_return, wait_for }) => {
+        if (/\.pdf(\?|#|$)/i.test(url)) {
+          return errorResult(
+            "This URL appears to be a PDF, which this tool can't parse.",
+          );
+        }
         const hasDelay =
           typeof delay_before_return === "number" && delay_before_return > 0;
         const hasWaitFor =
@@ -333,7 +367,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         if (!result.ok) return errorResult(result.message);
         const text = result.data.html ?? JSON.stringify(result.data);
         return { content: [{ type: "text", text }] };
-      },
+      }),
     );
 
     this.server.tool(
@@ -356,7 +390,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             "Height of the browser viewport in pixels. Increase for long pages to capture more vertical content in one image. Keep at or below ~3500 — taller values have failed in testing on visually dense pages (confirmed: Wikipedia's Berlin article failed at 4000 through the real connector, twice, while succeeding at 3000). If you need a taller capture, try it — this cap is conservative, not a hard engine limit — but treat failures as expected at the high end for image-heavy pages.",
           ),
       },
-      async ({ url, screenshot_wait_for, viewport_height }) => {
+      safeHandler(async ({ url, screenshot_wait_for, viewport_height }) => {
         const payload: Record<string, unknown> = {
           urls: [url],
           browser_config: {
@@ -405,7 +439,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "image", data: base64, mimeType: "image/png" }],
         };
-      },
+      }),
     );
 
     this.server.tool(
@@ -417,7 +451,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .array(z.string())
           .describe("JavaScript snippets to execute, in order"),
       },
-      async ({ url, scripts }) => {
+      safeHandler(async ({ url, scripts }) => {
         const result = await callEngine(this.env, "/execute_js", {
           url,
           scripts,
@@ -428,7 +462,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             { type: "text", text: JSON.stringify(result.data, null, 2) },
           ],
         };
-      },
+      }),
     );
 
     this.server.tool(
@@ -468,7 +502,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             "CSS selector to wait for before extracting, applied to every URL in this batch. Omit for fastest response.",
           ),
       },
-      async ({ urls, output, delay_before_return, wait_for }) => {
+      safeHandler(async ({ urls, output, delay_before_return, wait_for }) => {
         const payload: Record<string, unknown> = { urls };
         const crawler_config: Record<string, unknown> = {};
 
@@ -518,7 +552,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
         };
-      },
+      }),
     );
 
     this.server.tool(
@@ -543,7 +577,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .default(10)
           .describe("How many results to return (1-20, default 10)."),
       },
-      async ({ query, time_range, language, max_results }) => {
+      safeHandler(async ({ query, time_range, language, max_results }) => {
         const params: Record<string, string> = { q: query, format: "json" };
         if (time_range) params.time_range = time_range;
         if (language) params.language = language;
@@ -563,7 +597,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
         };
-      },
+      }),
     );
 
     this.server.tool(
@@ -578,7 +612,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .default(10)
           .describe("How many results to return (1-20, default 10)."),
       },
-      async ({ query, max_results }) => {
+      safeHandler(async ({ query, max_results }) => {
         const result = await callSearxng(this.env, "/search", {
           q: query,
           format: "json",
@@ -599,7 +633,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
         };
-      },
+      }),
     );
 
     this.server.tool(
@@ -618,7 +652,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           .default(10)
           .describe("How many results to return (1-20, default 10)."),
       },
-      async ({ query, time_range, max_results }) => {
+      safeHandler(async ({ query, time_range, max_results }) => {
         const params: Record<string, string> = {
           q: query,
           format: "json",
@@ -642,14 +676,14 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
         };
-      },
+      }),
     );
 
     this.server.tool(
       "search_suggestions",
       "Get autocomplete query suggestions for a partial search term — useful for query refinement before a full search.",
       { query: z.string().describe("Partial search term") },
-      async ({ query }) => {
+      safeHandler(async ({ query }) => {
         const result = await callSearxng(this.env, "/autocompleter", {
           q: query,
         });
@@ -663,14 +697,14 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: JSON.stringify(suggestions) }],
         };
-      },
+      }),
     );
 
     this.server.tool(
       "search_instance_info",
       "Discover the search categories, engines, and plugins available on this SearXNG instance.",
       {},
-      async () => {
+      safeHandler(async () => {
         const result = await callSearxng(this.env, "/config", {});
         if (!result.ok) return errorResult(result.message);
 
@@ -692,7 +726,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
         return {
           content: [{ type: "text", text: JSON.stringify(trimmed, null, 2) }],
         };
-      },
+      }),
     );
   }
 }
