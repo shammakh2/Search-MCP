@@ -7,3 +7,28 @@ server:
   secret_key: "replace_with_your_own_generated_key"
   limiter: false
   image_proxy: true
+engines:
+  # Activating other engines in case main ones are blocked
+  - name: bing
+    disabled: false
+  - name: yandex
+    disabled: false
+  - name: baidu
+    disabled: false
+  - name: 360search
+    disabled: false
+  # previously "leave off" list
+  - name: privacywall
+    disabled: false
+  - name: mwmbl
+    disabled: false
+  - name: searchmysite
+    disabled: false
+  - name: searchtoday
+    disabled: false
+  - name: brave
+    disabled: true
+  - name: duckduckgo
+    disabled: true
+  - name: startpage
+    disabled: true
