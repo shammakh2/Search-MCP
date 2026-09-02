@@ -118,13 +118,14 @@ async function callSearxng(
   let response: Response;
   try {
     response = await fetch(url.toString(), {
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(30_000),
     });
   } catch (err: any) {
     if (err.name === "TimeoutError" || err.name === "AbortError") {
       return {
         ok: false,
-        message: "Search engine did not respond within 15s.",
+        message:
+          "Search engine did not respond within 30s. Retry the same query please.",
       };
     }
     return {
